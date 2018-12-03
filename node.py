@@ -12,59 +12,140 @@ import asyncio
 import aiohttp
 from aiohttp import web
 
+class View:
+    def __init__(self, leader_node = 0, times_for_leader = 0):
+        self.leader_node = leader_node
+        self.times_for_leader = times_for_leader
+    # To encode to json
+    def _to_tuple(self):
+        return (self.leader_node, self.times_for_leader)
+    # Recover from json data.
+    def _update_from_tuple(self, view_tuple):
+        self.leader_node = view_tuple[0]
+        self.times_for_leader = view_tuple[1]
+
+class Status:
+    PREPARE = 'prepare'
+    COMMIT = 'commit'
+
+    def __init__(self, f):
+        self.f = f
+        self.request = 0
+        self.prepare_msgs = {}     
+        self.prepare_certificate = None # proposal
+        self.commit_msgs = {} 
+        self.commit_certificate = None # proposal
+        
+
+    class SequenceElement:
+        def __init__(self, proposal):
+            self.proposal = proposal
+            self.from_nodes = set([])
+
+    def _update_sequence(self, msg_type, view, proposal, from_node):
+        '''
+        Update the record in the status by message type
+        input:
+            msg_type: self.PREPARE or self.COMMIT
+            view: View object of self._follow_view
+            proposal: proposal in json_data
+            from_node: The node send given the message.
+        '''
+
+        # The key need to include hash(proposal) in case get 
+        # different preposals from BFT nodes.
+        key = (view._to_tuple(), hash(json.dumps(proposal)))
+        if msg_type == 'prepare':
+            if key not in self.prepare_msgs:
+                self.prepare_msgs[key] = self.SequenceElement(proposal)
+            self.prepare_msgs[key].from_nodes.add(from_node)
+        elif msg_type == 'commit':
+            if key not in self.commit_msgs:
+                self.commit_msgs[key] = self.SequenceElement(proposal)
+            self.commit_msgs[key].from_nodes.add(from_node)
+
+    def _check_majority(self, msg_type):
+        '''
+        Check if receive more than sf + 1 given type message in the same view.
+        input:
+            msg_type: self.PREPARE or self.COMMIT
+        '''
+        if msg_type == 'prepare':
+            if self.prepare_certificate:
+                return True
+            for key in self.prepare_msgs:
+                if len(self.prepare_msgs[key].from_nodes)>= 2 * self.f + 1:
+                    return True
+            return False
+
+        if msg_type == 'commit':
+            if self.commit_certificate:
+                return True
+            for key in self.commit_msgs:
+                if len(self.commit_msgs[key].from_nodes) >= 2 * self.f + 1:
+                    return True
+            return False 
+
+
+
 
 class MultiPaxosHandler:
-    PREPARE = 'prepare'
-    ACCEPT = 'accept'
-    LEARN = 'learn'
-    HEARTBEAT = 'heartbeat'
     REQUEST = 'request'
+    PREPREPARE = 'preprepare'
+    PREPARE = 'prepare'
+    COMMIT = 'commit'
+    REPLY = 'reply'
+    HEARTBEAT = 'heartbeat'
+    
     SYNC = 'sync'
 
     NO_OP = 'NOP'
 
-    def __init__(self, ind, conf):
+    def __init__(self, index, conf):
         self._nodes = conf['nodes']
         self._node_cnt = len(self._nodes)
-        self._me = self._nodes[ind]
-        self._ind = ind
+        self._me = self._nodes[index]
+        self._index = index
+        # Number of faults tolerant.
+        self.f = (self._node_cnt - 1) // 3
 
-        ## leader election
+        # leader election
         self._last_heartbeat = 0
         self._heartbeat_ttl = conf['heartbeat']['ttl']
         self._heartbeat_interval = conf['heartbeat']['interval']
         self._election_slice = conf['election_slice']
 
-        ## leader
-        # view_id = cur_time // election_slice; seq = self._seq
-        # (view_id, seq)
-        self._n = (0, 0)
-        # Accumulated number of total proposals proposed by the given node
-        self._seq = 0
+        # leader
+        self._view = View(self._index, 0)
         self._next_new_slot = 0
-        self._is_leader = False
+
+        # TODO: Test fixed
+        if self._index == 0:
+            self._is_leader = True
+        else:
+            False
+
         self._hb_server = None
 
-        ## acceptor
         # Indicate my current leader.
-        self._leader = None
-        ## better named n_promise_accept, the largest number either promised or accepted
-        # Same format as self._n. Indicate current view and leader's sequence
-        self._n_promise = (0, 0)
-        self._accepted = {} # s: (n, v)
 
-        ## learner
+        # TODO: Test fixed
+        self._leader = 0
+        # The largest view either promised or accepted
+        # Same format as View._to_tuple
+        self._follow_view = View(0, 0)
+        
+        # Record all the status of the given slot
+        self._status_by_slot = {}
+
+        # learner
         self._sync_interval = conf['sync_interval']
         self._learning = {} # s: Counter(n: cnt)
         self._learned = [] # Bubble is represented by None
         self._learned_event = {} # s: event
-
-        # Number of commit accumulated.
-        self._accumulate_commit = 0
  
         # -
         self._loss_rate = conf['loss%'] / 100
-        self._skip = conf['skip']
 
         # -
         self._network_timeout = conf['misc']['network_timeout']
@@ -72,15 +153,17 @@ class MultiPaxosHandler:
         self._log = logging.getLogger(__name__) 
 
         ## Update timeout for thew network system
-        self._init_network_timeout = conf['misc']['network_timeout']
-        self._init_heartbeat_interval = conf['heartbeat']['ttl']
-        # Time record from send to ACK for last _numexec_time_records executions.
-        self._network_time_queue = []
-        self._num_exec_time_records = 100
-        self._last_session_create_time = time.time()
+        self._heartbeat_interval = conf['heartbeat']['ttl']
 
     @staticmethod
     def make_url(node, command):
+        '''
+        input: 
+            node: dictionary with key of host(url) and port
+            command: action
+        output:
+            The url to send with given node and action.
+        '''
         return "http://{}:{}/{}".format(node['host'], node['port'], command)
 
     async def _make_requests(self, nodes, command, json_data):
@@ -120,453 +203,233 @@ class MultiPaxosHandler:
             await asyncio.sleep(self._network_timeout)
         return resp
 
-    async def _elect(self, view_id):
+    async def _post(self, nodes, command, json_data):
         '''
-        Compete for election.
-
-        1. Setup up `n`
-        2. Call prepare(n, bubble_slots, next_new_slot) to all nodes
-        3. Count vote
-        4. New leader if possible
-            1. Initial heartbeat
-            2. Accept!
+        Broadcast json_data to all node in nodes with given command
+        input:
+            nodes: list of nodes
+            command: action
+            json_data: Data in json format.
         '''
-        self._log.info("---> %d: run election", self._ind)
+        if not self._session:
+            timeout = aiohttp.ClientTimeout(self._network_timeout)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        for i, node in enumerate(nodes):
+            if random() > self._loss_rate:
+                self._log.debug("make request to %d, %s", i, command)
+                try:
+                    _ = await self._session.post(self.make_url(node, command), json=json_data)
+                except Exception as e:
+                    #resp_list.append((i, e))
+                    self._log.error(e)
+                    pass
 
-        self._seq += 1
-        self._n = (view_id, self._seq)
-
-        # Only ask for things this proposer doesn't know.
-        bubble_slots = []
-        for i, v in enumerate(self._learned):
-            if v == None:
-                bubble_slots.append(i)
-
-        json_data = {
-                'leader': self._ind,
-                'n': self._n,
-                'bubble_slots': bubble_slots,
-                'next_new_slot': len(self._learned),
+    async def preprepare(self, request):
+        '''
+        Prepare: Deal with request from the client and broadcast to other replicas.
+        input:
+            request: web request from client
+                json = 
+                {
+                    id: (cid, seq),
+                    client_url: "url string"
+                    timestamp:"time"
+                    data: "string"
                 }
 
-        resp_list = await self._make_requests(self._nodes, MultiPaxosHandler.PREPARE, json_data)
-
-        # Count vote
-        count = 0
-        nv_for_known_slots = {}
-        for i, resp in resp_list:
-            if resp.status == 499: #TODO, give up
-                self._log.warn("------> %d: give up on Nack", self._ind, i)
-                return
-            if resp.status == 200:
-                try:
-                    json_data = await resp.json()
-                except:
-                    pass
-                else:
-                    for s, (n, v) in json_data['known_slots'].items():
-                        s = int(s)
-                        if s in nv_for_known_slots:
-                            nv_for_known_slots[s] = max(nv_for_known_slots[s], (n,v), key = lambda x: x[0])
-                        else:
-                            nv_for_known_slots[s] = (n, v)
-                    count += 1
-
-        self._log.info("------> %d: votes received %d", self._ind, count)
-
-        # New leader now
-        if count >= self._node_cnt // 2 + 1:
-            self._log.info("------> %d: become new leader", self._ind)
-            self._is_leader = True
-
-            # Catch up
-            proposal = {k: v[1] for k, v in nv_for_known_slots.items()}
-
-            for b in bubble_slots: # fill in bubble
-                if not b in proposal:
-                    proposal[b] = MultiPaxosHandler.NO_OP
-
-            if proposal:
-                max_slot_in_proposal = max(proposal.keys())
-            else:
-                max_slot_in_proposal = -1
-            self._next_new_slot = max(max_slot_in_proposal + 1, len(self._learned))
-            for s in range(len(self._learned), self._next_new_slot):
-                if s not in proposal:
-                    proposal[s] = MultiPaxosHandler.NO_OP
-
-            # First command: Accept!
-            json_data = {
-                    'leader': self._ind,
-                    'n': self._n,
-                    'proposal': proposal
-                    }
-
-            resp_list = await self._make_requests(self._nodes, MultiPaxosHandler.ACCEPT, json_data)
-            for i, resp in resp_list:
-                if resp.status == 499:
-                    self._log.warn("------> %d: give up on Nack", self._ind, i)
-                    # step down
-                    self._is_leader = False
-                    return
-
-            # Initiate heartbeat!
-            self._hb_server = asyncio.ensure_future(self._heartbeat_server())
-
-    async def _heartbeat_server(self):
-        '''
-        Send heartbeat to every node.
-
-        If get 499 as Nack, step down.
-        '''
-        while True:
-            resp_list = await self._make_requests(self._nodes, MultiPaxosHandler.HEARTBEAT, { 'leader': self._ind, 'n': self._n })
-            
-            for i, resp in resp_list:
-                if resp.status == 499:
-                    # step down
-                    self._is_leader = False
-                    self._hb_server = None
-                    return
-            await asyncio.sleep(self._heartbeat_interval)
-
-    async def heartbeat_observer(self):
-        '''
-        Observe hearbeat: if timeout, run election if appropriate.
-        '''
-        while True:
-            await asyncio.sleep(self._heartbeat_interval)
-            cur_ts = time.time()
-            if self._last_heartbeat < cur_ts - self._heartbeat_ttl: 
-                self._log.warn("---> %d: heartbeat missing", self._ind)
-                view_id = cur_ts // self._election_slice
-                if view_id % self._node_cnt == self._ind:
-                    # run election
-                    asyncio.ensure_future(self._elect(view_id))
-
-    async def heartbeat(self, request):
-        '''
-        Hearbeat sent from leader.
-        {
-            leader: 0,
-            n: [ view_id, seq ],
-        }
-
-        respond with 200 if `n` is geq than current believed `n_promise`,
-        else return 499
         '''
 
         json_data = await request.json()
-        n_hb = tuple(json_data['n'])
-        if n_hb > self._n_promise: #TODO: should be safe to update self._n_promise
-            self._n_promise = n_hb
-            self._leader = json_data['leader']
-            self._last_heartbeat = time.time()
-            code = 200
-        elif n_hb == self._n_promise:
-            self._last_heartbeat = time.time()
-            code = 200
-        else:
-            code = 499
 
-        return await self._make_response(web.Response(status=code))
+        self._log.info("---> %d: on preprepare", self._index)
+        this_slot = self._next_new_slot
+        self._next_new_slot = this_slot + 1
 
-    async def prepare(self, request):
-        '''
-        Prepare request from a proposer.
+        if this_slot not in self._status_by_slot:
+            self._status_by_slot[this_slot] = Status(self.f)
+        self._status_by_slot[this_slot].request = json_data
 
-        {
-            leader:
-            n: 
-            bubble_slots: []
-            next_new_slot: 
+        preprepare_msg = {
+            'leader': self._index,
+            'view': self._view._to_tuple(),
+            'proposal': {
+                this_slot: json_data
+            },
+            'type': 'preprepare'
         }
-
-        respond with 200 as Ack if `n` is geq than current believed `n_promise`,
-        else return 499 as Nack
-
-
-        Ack:
-
-        {
-            known_slots: {
-                0: (n, v),
-                3: (n, v)
-            }
-        }
-        '''
-        self._log.info("---> %d: on prepare", self._ind)
-
-        json_data = await request.json()
-        n_prepare = tuple(json_data['n'])
-        if n_prepare > self._n_promise: # Only Ack if n_prepare larger than the largest n ever seen.
-            self._n_promise = n_prepare
-            self._leader = json_data['leader']
-            self._last_heartbeat = time.time() # also treat as a heartbeat
-
-            bubble_slots = json_data['bubble_slots']
-            next_new_slot = json_data['next_new_slot']
-
-            known_slots = {}
-            for b in bubble_slots:
-                if b in self._accepted:
-                    known_slots[b] = self._accepted[b]
-                elif b < len(self._learned) and self._learned[b]: # return learned value directly, fake `n`
-                    known_slots[b] = (n_prepare, self._learned[b])
-
-            for b in self._accepted:
-                if b >= next_new_slot:
-                    known_slots[b] = self._accepted[b]
-
-            for i in range(next_new_slot, len(self._learned)):
-                if self._learned[i]:
-                    known_slots[i] = (n_prepare, self._learned[i])
-
-            json_data = {'known_slots': known_slots}
-            ret = web.json_response(json_data)
-        else:
-            ret = web.Response(status=499)
-
-        return await self._make_response(ret)
-
-    async def accept(self, request):
-        '''
-        Accept request from a proposer.
-
-        Accept: {
-            leader:
-            n: 
-            proposal: {
-                0: v,
-                13: v,
-            }
-        }
-
-        respond with 200 as OK if `n` is geq than current believed `n_promise`,
-        else return 499 as Nack
-
-        Make LEARN request to all nodes if accepted.
-        '''
-        self._log.info("---> %d: on accept", self._ind)
-
-        json_data = await request.json()
-        n_accept = tuple(json_data['n'])
-        if n_accept >= self._n_promise: # Only Accept if n_accept geq than the largest n ever seen.
-            self._n_promise = n_accept
-            self._leader = json_data['leader']
-            proposal = json_data['proposal']
-            for s, v in proposal.items():
-                s = int(s)
-                if not s < len(self._learned) or not self._learned[s]:
-                    self._accepted[s] = (n_accept, v)
-                asyncio.ensure_future(self._make_requests(self._nodes, MultiPaxosHandler.LEARN, { 'n': n_accept, 'proposal': proposal }))
-            ret = web.Response()
-        else:
-            ret = web.Response(status=499)
-
-        return await self._make_response(ret)
-
-    async def learn(self, request):
-        '''
-        Learn request from nodes.
-
-        {
-            n: 
-            proposal: {
-                0: v,
-                3: v,
-            }
-        }
-
-        No response needed
-        '''
-        self._log.info("---> %d: on learn", self._ind)
-
-        json_data = await request.json()
-        proposal = json_data['proposal']
-        n = tuple(json_data['n'])
-        for s, v in proposal.items():
-            s = int(s)
-            if not s < len(self._learned) or not self._learned[s]:
-                if not s in self._learning:
-                    self._learning[s] = Counter()
-                self._learning[s][n] += 1
-                if self._learning[s][n] >= self._node_cnt // 2 + 1:
-                    if not s < len(self._learned):
-                        self._learned += [None] * (s + 1 - len(self._learned))
-                    self._learned[s] = v
-                    # Delete useless info after learn the given slot.
-                    if s in self._learning:
-                        del self._learning[s]
-                    if s in self._accepted:
-                        del self._accepted[s]
-            
-                    while self._accumulate_commit < len(self._learned) and self._learned[self._accumulate_commit] != None:
-                        if self._accumulate_commit in self._learned_event:
-                            self._learned_event[self._accumulate_commit].set()
-                            del self._learned_event[self._accumulate_commit]
-                        self._accumulate_commit += 1
-        return await self._make_response(web.Response())
-
-    async def decision_synchronizer(self):
-        '''
-        Sync with other learner periodically.
-
-        Input/output similar to `prepare`
-    
-        {
-            known_slots: {
-                0: v,
-                3: v
-            }
-        }
-        '''
-        while True:
-            await asyncio.sleep(self._sync_interval)
-            self._log.info("%d:  Start synchronizing.", self._ind)
-            if not self._is_leader and self._leader != None:
-                # Only ask for things this learner doesn't know.
-                bubble_slots = []
-                for i, v in enumerate(self._learned):
-                    if v == None:
-                        self._log.info("%d: with bubble at slot %d.", self._ind, i)
-                        bubble_slots.append(i)
-
-                json_data = {
-                        'bubble_slots': bubble_slots,
-                        'next_new_slot': len(self._learned),
-                        }
-
-                # Leader nodehas the most updated information. As a result,
-                # only need to update learned result with leader node.
-                self._log.debug("%d:  Start asking filling the bubble.", self._ind)
-                
-                resp_list = await self._make_requests([self._nodes[self._leader]], MultiPaxosHandler.SYNC, json_data)
-                self._log.debug("%d:  Receive bubble filling message.", self._ind)
-                if resp_list:
-                    resp = resp_list[0][1]
-                    try:
-                        json_data = await resp.json()
-                    except:
-                        self._log.info("%d: Bad known slot message.", self._ind)
-                        pass
-                    else:
-                        for s, v in json_data['known_slots'].items():
-                            s = int(s)
-                            self._log.debug("%d: Update bubble %d by decision synchrosizer.", self._ind, s)
-                            if not s < len(self._learned):
-                                self._learned += [None] * (s + 1 - len(self._learned))
-                            self._learned[s] = v
-                            # Delete useless info after learn the given slot.
-                            if s in self._learning:
-                                del self._learning[s]
-                            if s in self._accepted:
-                                del self._accepted[s]
-                            # Once the former are all executed(Without bubble), we send ACK to the client of given slot. 
-                            while self._accumulate_commit < len(self._learned) and self._learned[self._accumulate_commit] != None:
-                                if self._accumulate_commit in self._learned_event:
-                                    self._learned_event[self._accumulate_commit].set()
-                                    del self._learned_event[self._accumulate_commit]
-                                self._accumulate_commit += 1
-            self._log.info("%d: accumulate commit: %d" , self._ind, self._accumulate_commit)
-            
-            with open("{}.dump".format(self._ind), 'w') as f:
-                json.dump(self._learned[:self._accumulate_commit], f)
-
-    async def sync(self, request):
-        '''
-        Sync request from learner.
-
-        {
-            bubble_slots: []
-            next_new_slot: 
-        }
-        '''
-        self._log.info("---> %d: on sync", self._ind)
-
-        json_data = await request.json()
-
-        bubble_slots = json_data['bubble_slots']
-        next_new_slot = json_data['next_new_slot']
-
-        known_slots = {}
-        for b in bubble_slots:
-            if b < len(self._learned) and self._learned[b]:
-                known_slots[str(b)] = self._learned[b]
-                self._log.info("%d: Fill bubble %d by sync.", self._ind, b)
-        for i in range(next_new_slot, len(self._learned)):
-            if self._learned[i]:
-                known_slots[str(i)] = self._learned[i]
-
-        json_data = {'known_slots': known_slots}
         
-        return await self._make_response(web.json_response(json_data))
+        await self._post(self._nodes, MultiPaxosHandler.PREPARE, preprepare_msg)
 
-    async def request(self, request):
+
+
+    async def get_request(self, request):
         '''
-        Request from client.
-
-        {
-            id: (cid, seq),
-            data: "string"
-        }
-
-        Handle this if leader, otherwise redirect to leader
+        Handle the request from client if leader, otherwise 
+        redirect to the leader.
         '''
-        self._log.info("---> %d: on request", self._ind)
+        self._log.info("---> %d: on request", self._index)
 
-        json_data = await request.json()
         if not self._is_leader:
             if self._leader != None:
                 raise web.HTTPTemporaryRedirect(self.make_url(self._nodes[self._leader], MultiPaxosHandler.REQUEST))
             else:
                 raise web.HTTPServiceUnavailable()
-
-        this_slot = self._next_new_slot
-        if this_slot == self._skip:
-            this_slot += 1
-        self._next_new_slot = this_slot + 1
-        proposal = {
-                'leader': self._ind,
-                'n': self._n,
-                'proposal': {
-                    this_slot: [json_data['id'], json_data['data']]
-                    }
-                }
-        if not this_slot in self._learned_event:
-            self._learned_event[this_slot] = asyncio.Event()
-        this_event = self._learned_event[this_slot]
-
-        resp_list = await self._make_requests(self._nodes, MultiPaxosHandler.ACCEPT, proposal)
-        for i, resp in resp_list:
-            if resp.status == 499:
-                self._log.warn("------> %d: give up on Nack from %d", self._ind, i)
-                # step down
-                self._is_leader = False
-                if self._hb_server:
-                    self._hb_server.cancel()
-                    self._hb_server = None
-                if self._leader != None and self._leader != self._ind:
-                    redirect = self._leader
-                else:
-                    redirect = i
-                raise web.HTTPTemporaryRedirect(self.make_url(self._nodes[redirect], MultiPaxosHandler.REQUEST))
-
-        # respond only when learner learned the value
-        await this_event.wait()
-        resp = web.Response()
-        
-        if self._learned[this_slot] == [json_data['id'], json_data['data']]:
-            resp = web.Response()
         else:
-            if self._leader != None and self._leader != self._ind:
-                redirect = self._leader
-            else:
-                redirect = randint(0, self._node_cnt-1)
-            raise web.HTTPTemporaryRedirect(self.make_url(self._nodes[redirect], MultiPaxosHandler.REQUEST))
-        
-        return await self._make_response(resp)
+            await self.preprepare(request)
+            return web.Response()
 
+    async def prepare(self, request):
+        '''
+        Once receive preprepare message from client, broadcast 
+        prepare message to all replicas.
+
+        input: 
+            request: preprepare message from preprepare:
+                preprepare_msg = {
+                    'leader': self._index,
+                    'view': self._view._to_tuple,
+                    'proposal': {
+                        this_slot: json_data
+                    }
+                    'type': 'preprepare'
+                }
+
+        '''
+        
+        json_data = await request.json()
+
+        if tuple(json_data['view']) < self._follow_view._to_tuple():
+            # when receive message with view < follow_view, do nothing
+            return web.Response()
+        elif tuple(json_data['view']) > self._follow_view._to_tuple():
+
+            # when receive message with view > follow_view, update view
+            self._follow_view._update_from_tuple(tuple(json_data['view']))
+
+        self._log.info("---> %d: on prepare", self._index)
+        for slot in json_data['proposal']:
+            if slot not in self._status_by_slot:
+                self._status_by_slot[slot] = Status(self.f)
+
+            prepare_msg = {
+                'index': self._index,
+                'view': json_data['view'],
+                'proposal': {
+                    slot: json_data['proposal'][slot]
+                },
+                'type': Status.PREPARE
+            }
+            await self._post(self._nodes, MultiPaxosHandler.COMMIT, prepare_msg)
+        return web.Response()
+
+    async def commit(self, request):
+        '''
+        Once receive more than 2f + 1 prepare message,
+        send the prepare message
+        input:
+            request: prepare message from preprepare:
+                prepare_msg = {
+                    'index': self._index,
+                    'view': self._n,
+                    'proposal': {
+                        this_slot: json_data
+                    }
+                    'type': 'prepare'
+                }
+        '''
+        json_data = await request.json()
+        
+
+        # when receive message with view < follow_view, do nothing
+        if tuple(json_data['view']) < self._follow_view._to_tuple():
+            return web.Response()
+
+        self._log.info("---> %d: on commit", self._index)
+        
+        for slot in json_data['proposal']:
+            if slot not in self._status_by_slot:
+                self._status_by_slot[slot] = Status(self.f)
+            status = self._status_by_slot[slot]
+
+            view = View()
+            view._update_from_tuple(tuple(json_data['view']))
+
+            status._update_sequence(json_data['type'], 
+                view, json_data['proposal'], json_data['index'])
+
+            if status._check_majority(json_data['type']):
+                status.prepare_certificate = json_data['proposal'][slot]
+                commit_msg = {
+                    'index': self._index,
+                    'view': json_data['view'],
+                    'proposal': {
+                        slot: json_data['proposal'][slot]
+                    },
+                    'type': Status.COMMIT
+                }
+                await self._post(self._nodes, MultiPaxosHandler.REPLY, commit_msg)
+        return web.Response()
+
+    async def reply(self, request):
+        '''
+        Once receive more than 2f + 1 commit message,
+        reply to the client.
+        input:
+            request: commit message from prepare:
+                preprepare_msg = {
+                    'index': self._index,
+                    'n': self._n,
+                    'proposal': {
+                        this_slot: json_data
+                    }
+                    'type': 'commit'
+                }
+        '''
+        
+        json_data = await request.json()
+        self._log.info("---> %d: on reply", self._index)
+
+        # when receive message with view < follow_view, do nothing
+        if tuple(json_data['view']) < self._follow_view._to_tuple():
+            return web.Response()
+
+        for slot in json_data['proposal']:
+            if slot not in self._status_by_slot:
+                self._status_by_slot[slot] = Status(self.f)
+            status = self._status_by_slot[slot]
+
+            view = View()
+            view._update_from_tuple(tuple(json_data['view']))
+
+            status._update_sequence(json_data['type'], 
+                view, json_data['proposal'], json_data['index'])
+
+            print("state: ", status._check_majority(json_data['type']))
+            if status._check_majority(json_data['type']):
+                status.prepare_certificate = json_data['proposal'][slot]
+
+                reply_msg = {
+                    'index': self._index,
+                    'view': json_data['view'],
+                    'proposal': json_data['proposal'][slot],
+                    'type': 'reply'
+                }
+
+                print("reply to: ", json_data['proposal'][slot]['client_url'])
+                self._log.info("%d reply successfully!!", self._index)
+                """
+                try:
+                    await self._session.post(json_data['proposal'][slot]['client_url'], json=reply_msg)
+                except:
+                    pass
+                """
+        return web.Response()
+
+    async def sync(self):
+        pass
+
+    async def heartbeat(self):
+        pass
 
 def logging_config(log_level=logging.INFO, log_file=None):
     root_logger = logging.getLogger()
@@ -641,17 +504,18 @@ def main():
     port = addr['port']
 
     paxos = MultiPaxosHandler(args.index, conf)
-    asyncio.ensure_future(paxos.heartbeat_observer())
-    asyncio.ensure_future(paxos.decision_synchronizer())
+    # asyncio.ensure_future(paxos.heartbeat_observer())
+    # asyncio.ensure_future(paxos.decision_synchronizer())
 
     app = web.Application()
     app.add_routes([
-        web.post('/' + MultiPaxosHandler.HEARTBEAT, paxos.heartbeat),
+        web.post('/' + MultiPaxosHandler.REQUEST, paxos.get_request),
+        web.post('/' + MultiPaxosHandler.PREPREPARE, paxos.preprepare),
         web.post('/' + MultiPaxosHandler.PREPARE, paxos.prepare),
-        web.post('/' + MultiPaxosHandler.ACCEPT, paxos.accept),
-        web.post('/' + MultiPaxosHandler.LEARN, paxos.learn),
+        web.post('/' + MultiPaxosHandler.COMMIT, paxos.commit),
+        web.post('/' + MultiPaxosHandler.REPLY, paxos.reply),
         web.post('/' + MultiPaxosHandler.SYNC, paxos.sync),
-        web.post('/' + MultiPaxosHandler.REQUEST, paxos.request),
+        web.post('/' + MultiPaxosHandler.HEARTBEAT, paxos.heartbeat),
         ])
 
     web.run_app(app, host=host, port=port, access_log=None)
