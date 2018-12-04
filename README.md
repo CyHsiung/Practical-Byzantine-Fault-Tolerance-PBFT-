@@ -1,7 +1,7 @@
-A simple Multi-Paxos protocol over HTTP, using python3 asyncio/aiohttp. This is just a proof of concept implementation, for my study of distributed systems, and also for me to not forget about asyncio.
+A simple PBFT protocol over HTTP, using python3 asyncio/aiohttp. This is just a proof of concept implementation.
 
 ## Configuration
-A `paxos.yaml` config file is needed for the nodes to run. A sample is as follows:
+A `pbft.yaml` config file is needed for the nodes to run. A sample is as follows:
 ```Yaml
 nodes:
     - host: localhost
@@ -13,9 +13,12 @@ nodes:
     - host: localhost
       port: 30003
     - host: localhost
-      port: 30004
+
+clients:
     - host: localhost
-      port: 30005
+      port: 20001
+    - host: localhost
+      port: 20002
 
 loss%: 0
 
@@ -34,14 +37,14 @@ misc:
 ```
 
 ## Run the nodes
-`for i in {0..5}; do ./node.py -i $i &; done`
+`for i in {0..3}; do python ./node.py -i $i -lf False  &; done`
 
 ## Send request to any one of the nodes
-e.g. `curl -vLX POST --data '{ "id": [0,0], "data": "helloworld"}' http://localhost:30000/request`
-The `id` here is a tuple of `(client_id, seq_id)`, `data` is whatever data in string format.
+e.g. `curl -vLX POST --data '{ 'id': (0, 0), 'client_url': http://localhost:20001/reply,
+    'timestamp': time.time(),'data': 'data_string'}' http://localhost:30000/request`
+The `id` here is a tuple of `(client_id, seq_id)`, `client_url` is the url for sending request to the get_reply function,
+`timestamp` is the current time, `data` is whatever data in string format, 
 
 ## Run the clients
-for i in {0...3}; do python client.py -id $i -nm 15 &; done
+for i in {0...2}; do python client.py -id $i -nm 5 &; done
 
-## Check the consistency
-`for i in .*.dump; do hash $i; done`
