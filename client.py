@@ -8,8 +8,62 @@ import asyncio
 import aiohttp
 from aiohttp import web
 from random import random
+import hashlib
 
 
+
+class View:
+    def __init__(self, leader_node = 0, times_for_leader = 0):
+        self.leader_node = leader_node
+        self.times_for_leader = times_for_leader
+    # To encode to json
+    def _to_tuple(self):
+        return (self.leader_node, self.times_for_leader)
+    # Recover from json data.
+    def _update_from_tuple(self, view_tuple):
+        self.leader_node = view_tuple[0]
+        self.times_for_leader = view_tuple[1]
+
+class Status:
+    def __init__(self, f):
+        self.f = f
+        self.reply_msgs = {}
+
+    class SequenceElement:
+        def __init__(self, proposal):
+            self.proposal = proposal
+            self.from_nodes = set([])
+
+    def _update_sequence(self, view, proposal, from_node):
+        '''
+        Update the record in the status by message type
+        input:
+            view: View object of self._follow_view
+            proposal: proposal in json_data
+            from_node: The node send given the message.
+        '''
+
+        # The key need to include hash(proposal) in case get different 
+        # preposals from BFT nodes. Need sort key in json.dumps to make 
+        # sure getting the same string. Use hashlib so that we got same 
+        # hash everytime.
+        hash_object = hashlib.md5(json.dumps(proposal, sort_keys=True).encode())
+        key = (view._to_tuple(), hash_object.digest())
+        if key not in self.reply_msgs:
+            self.reply_msgs[key] = self.SequenceElement(proposal)
+        self.reply_msgs[key].from_nodes.add(from_node)
+
+    def _check_succeed(self, ):
+        '''
+        Check if receive more than f + 1 given type message in the same view.
+        input:
+            msg_type: self.PREPARE or self.COMMIT
+        '''
+        
+        for key in self.reply_msgs:
+            if len(self.reply_msgs[key].from_nodes)>= self.f + 1:
+                return True
+        return False
 
 def logging_config(log_level=logging.INFO, log_file=None):
     root_logger = logging.getLogger()
@@ -34,10 +88,10 @@ def logging_config(log_level=logging.INFO, log_file=None):
 
 def arg_parse():
     # parse command line options
-    parser = argparse.ArgumentParser(description='Multi-Paxos Node')
+    parser = argparse.ArgumentParser(description='PBFT Node')
     parser.add_argument('-id', '--client_id', type=int, help='client id')
     parser.add_argument('-nm', '--num_messages', default=10, type=int, help='number of message want to send for this client')
-    parser.add_argument('-c', '--config', default='paxos.yaml', type=argparse.FileType('r'), help='use configuration [%(default)s]')
+    parser.add_argument('-c', '--config', default='pbft.yaml', type=argparse.FileType('r'), help='use configuration [%(default)s]')
     args = parser.parse_args()
     return args
 
@@ -72,38 +126,96 @@ def conf_parse(conf_file) -> dict:
 def make_url(node, command):
     return "http://{}:{}/{}".format(node['host'], node['port'], command)
 
-async def SendData(conf, args, log):
-    nodes = conf['nodes']
-    resend_interval = conf['misc']['network_timeout']
-    is_sent = False
-    client_id = args.client_id
-    num_messages = args.num_messages
+class Client:
+    REQUEST = "request"
+    REPLY = "reply"
 
-    timeout = aiohttp.ClientTimeout(resend_interval)
-    session = aiohttp.ClientSession(timeout = timeout)
- 
-    for i in range(num_messages):
-        is_sent = False
-        json_data = {
-                'id': (client_id, i),
-                'data': "client_id = " + str(client_id) + " # of message: " + str(i),
+    def __init__(self, conf, args, log):
+        self._nodes = conf['nodes']
+        self._resend_interval = conf['misc']['network_timeout']
+        self._client_id = args.client_id
+        self._num_messages = args.num_messages
+        self._session = None
+        self._address = conf['clients'][self._client_id]
+        self._client_url = "http://{}:{}".format(self._address['host'], 
+            self._address['port'])
+        self._log = log
+
+        # Number of faults tolerant.
+        self._f = (len(self._nodes) - 1) // 3
+
+        # Event for sending next request
+        self._is_request_suceed = None
+        # To record the status of current request
+        self._status = None
+
+    async def get_reply(self, request):
+        '''
+        Count the number of valid reply messages and decide whether request succeed:
+            1. Process the request only if timestamp is still valid(not stall)
+            2. Count the number of reply message within same view, 
+               if above f + 1, means success.
+        input:
+            request:
+                reply_msg = {
+                    'index': self._index,
+                    'view': json_data['view'],
+                    'proposal': json_data['proposal'][slot],
+                    'type': Status.REPLY
                 }
-        dest_ind = 0
-        # Every time succeed in sending message, wait for 0 - 1 second.
-        await asyncio.sleep(random())
-        while 1:
-            try:
-                await asyncio.wait_for(session.post(make_url(nodes[dest_ind], 'request'), 
-                    json=json_data), resend_interval)
-            except:
-                log.info("---> %d message %d sent fail.", client_id, i)
-                pass
-            else:
-                log.info("---> %d message %d sent successfully..", client_id, i)
-                is_sent = True
-            if is_sent:
-                break
-    session.close()
+        output:
+            Web.Response
+        '''
+        json_data = await request.json()
+        if time.time() - json_data['proposal']['timestamp'] >= self._resend_interval:
+            return web.Response()
+
+        view = View()
+        view._update_from_tuple(tuple(json_data['view']))
+        self._status._update_sequence(view, json_data['proposal'], json_data['index'])
+
+        if self._status._check_succeed():
+            self._log.info("Get reply from %d", json_data['index'])
+            self._is_request_suceed.set()
+
+        return web.Response()
+
+
+    async def request(self):
+        if not self._session:
+            timeout = aiohttp.ClientTimeout(self._resend_interval)
+            self._session = aiohttp.ClientSession(timeout = timeout)
+         
+        for i in range(self._num_messages):
+            is_sent = False
+            dest_ind = 0
+            self._is_request_suceed = asyncio.Event()
+            # Every time succeed in sending message, wait for 0 - 1 second.
+            await asyncio.sleep(random())
+            json_data = {
+                'id': (self._client_id, i),
+                'client_url': self._client_url + "/" + Client.REPLY,
+                'timestamp': time.time(),
+                'data': str(i)        
+            }
+            while 1:
+                try:
+                    self._status = Status(self._f)
+                    await self._session.post(make_url(self._nodes[dest_ind], Client.REQUEST), json=json_data)
+
+                    await asyncio.wait_for(self._is_request_suceed.wait(), self._resend_interval)
+                except:
+                    json_data['timestamp'] = time.time()
+                    self._status = Status(self._f)
+                    self._is_request_suceed.clear()
+                    self._log.info("---> %d message %d sent fail.", self._client_id, i)
+                    pass
+                else:
+                    self._log.info("---> %d message %d sent successfully.", self._client_id, i)
+                    is_sent = True
+                if is_sent:
+                    break
+        self._session.close()
     
 
 def main():
@@ -113,11 +225,30 @@ def main():
     conf = conf_parse(args.config)
     log.debug(conf)
 
-    addr = conf['nodes'][0]
+    addr = conf['clients'][args.client_id]
     log.info("begin")
     
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(SendData(conf, args, log))
+
+    client = Client(conf, args, log)
+
+    addr = client._address
+    host = addr['host']
+    port = addr['port']
+
+
+    asyncio.ensure_future(client.request())
+
+    app = web.Application()
+    app.add_routes([
+        web.post('/' + Client.REPLY, client.get_reply),
+    ])
+
+    web.run_app(app, host=host, port=port, access_log=None)
+
+
+    
+    # loop = asyncio.get_event_loop()
+    # loop.run_until_complete(client.request())
 
 if __name__ == "__main__":
     main()

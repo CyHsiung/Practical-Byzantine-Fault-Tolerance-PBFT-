@@ -1,4 +1,4 @@
-for i in {0..3}
+for i in {0..1}
 do
-   python ./client.py -id $i -nm 15  &
+   python ./client.py -id $i -nm 5 & 
 done

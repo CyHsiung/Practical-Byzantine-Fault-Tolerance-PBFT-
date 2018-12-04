@@ -1,0 +1,30 @@
+nodes:
+    - host: localhost
+      port: 30000
+    - host: localhost
+      port: 30001
+    - host: localhost
+      port: 30002
+    - host: localhost
+      port: 30003
+
+clients:
+    - host: localhost
+      port: 20001
+    - host: localhost
+      port: 20002
+
+loss%: 0
+
+skip:
+
+heartbeat:
+    ttl: 20
+    interval: 10
+
+election_slice: 10
+
+sync_interval: 10
+
+misc:
+    network_timeout: 10

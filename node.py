@@ -424,14 +424,15 @@ class PBFTHandler:
                     'proposal': json_data['proposal'][slot],
                     'type': Status.REPLY
                 }
-
-                self._log.info("%d reply to %s successfully!!", 
-                    self._index, json_data['proposal'][slot]['client_url'])
                 
                 try:
                     await self._session.post(json_data['proposal'][slot]['client_url'], json=reply_msg)
                 except:
+                    self._log.error("Send message failed to %s", json_data['proposal'][slot]['client_url'])
                     pass
+                else:
+                    self._log.info("%d reply to %s successfully!!", 
+                        self._index, json_data['proposal'][slot]['client_url'])
                 
         return web.Response()
 
@@ -464,9 +465,9 @@ def logging_config(log_level=logging.INFO, log_file=None):
 
 def arg_parse():
     # parse command line options
-    parser = argparse.ArgumentParser(description='Multi-Paxos Node')
+    parser = argparse.ArgumentParser(description='PBFT Node')
     parser.add_argument('-i', '--index', type=int, help='node index')
-    parser.add_argument('-c', '--config', default='paxos.yaml', type=argparse.FileType('r'), help='use configuration [%(default)s]')
+    parser.add_argument('-c', '--config', default='pbft.yaml', type=argparse.FileType('r'), help='use configuration [%(default)s]')
     parser.add_argument('-lf', '--log_to_file', default=False, type=bool, help='Whether to dump log messages to file, default = False')
     args = parser.parse_args()
     return args
