@@ -145,7 +145,7 @@ class Client:
         self._f = (len(self._nodes) - 1) // 3
 
         # Event for sending next request
-        self._is_request_suceed = None
+        self._is_request_succeed = None
         # To record the status of current request
         self._status = None
 
@@ -176,7 +176,7 @@ class Client:
 
         if self._status._check_succeed():
             self._log.info("Get reply from %d", json_data['index'])
-            self._is_request_suceed.set()
+            self._is_request_succeed.set()
 
         return web.Response()
 
@@ -189,7 +189,7 @@ class Client:
         for i in range(self._num_messages):
             is_sent = False
             dest_ind = 0
-            self._is_request_suceed = asyncio.Event()
+            self._is_request_succeed = asyncio.Event()
             # Every time succeed in sending message, wait for 0 - 1 second.
             await asyncio.sleep(random())
             json_data = {
@@ -203,11 +203,11 @@ class Client:
                     self._status = Status(self._f)
                     await self._session.post(make_url(self._nodes[dest_ind], Client.REQUEST), json=json_data)
 
-                    await asyncio.wait_for(self._is_request_suceed.wait(), self._resend_interval)
+                    await asyncio.wait_for(self._is_request_succeed.wait(), self._resend_interval)
                 except:
                     json_data['timestamp'] = time.time()
                     self._status = Status(self._f)
-                    self._is_request_suceed.clear()
+                    self._is_request_succeed.clear()
                     self._log.info("---> %d message %d sent fail.", self._client_id, i)
                     pass
                 else:

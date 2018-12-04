@@ -49,7 +49,7 @@ class Status:
         '''
         Update the record in the status by message type
         input:
-            msg_type: self.PREPARE or self.COMMIT
+            msg_type: Status.PREPARE or Status.COMMIT
             view: View object of self._follow_view
             proposal: proposal in json_data
             from_node: The node send given the message.
@@ -101,9 +101,6 @@ class PBFTHandler:
     PREPARE = 'prepare'
     COMMIT = 'commit'
     REPLY = 'reply'
-    HEARTBEAT = 'heartbeat'
-    
-    SYNC = 'sync'
 
     NO_OP = 'NOP'
 
@@ -129,12 +126,9 @@ class PBFTHandler:
         if self._index == 0:
             self._is_leader = True
         else:
-            False
-
-        self._hb_server = None
+            self._is_leader = False
 
         # Indicate my current leader.
-
         # TODO: Test fixed
         self._leader = 0
         # The largest view either promised or accepted
@@ -143,12 +137,6 @@ class PBFTHandler:
         
         # Record all the status of the given slot
         self._status_by_slot = {}
-
-        # learner
-        self._sync_interval = conf['sync_interval']
-        self._learning = {} # s: Counter(n: cnt)
-        self._learned = [] # Bubble is represented by None
-        self._learned_event = {} # s: event
  
         # -
         self._loss_rate = conf['loss%'] / 100
@@ -158,8 +146,6 @@ class PBFTHandler:
         self._session = None
         self._log = logging.getLogger(__name__) 
 
-        ## Update timeout for thew network system
-        self._heartbeat_interval = conf['heartbeat']['ttl']
 
     @staticmethod
     def make_url(node, command):
@@ -436,12 +422,6 @@ class PBFTHandler:
                 
         return web.Response()
 
-    async def sync(self):
-        pass
-
-    async def heartbeat(self):
-        pass
-
 def logging_config(log_level=logging.INFO, log_file=None):
     root_logger = logging.getLogger()
     if root_logger.hasHandlers():
@@ -525,8 +505,6 @@ def main():
         web.post('/' + PBFTHandler.PREPARE, pbft.prepare),
         web.post('/' + PBFTHandler.COMMIT, pbft.commit),
         web.post('/' + PBFTHandler.REPLY, pbft.reply),
-        web.post('/' + PBFTHandler.SYNC, pbft.sync),
-        web.post('/' + PBFTHandler.HEARTBEAT, pbft.heartbeat),
         ])
 
     web.run_app(app, host=host, port=port, access_log=None)
