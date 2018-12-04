@@ -95,7 +95,7 @@ class Status:
 
 
 
-class MultiPaxosHandler:
+class PBFTHandler:
     REQUEST = 'request'
     PREPREPARE = 'preprepare'
     PREPARE = 'prepare'
@@ -264,7 +264,7 @@ class MultiPaxosHandler:
             'type': 'preprepare'
         }
         
-        await self._post(self._nodes, MultiPaxosHandler.PREPARE, preprepare_msg)
+        await self._post(self._nodes, PBFTHandler.PREPARE, preprepare_msg)
 
 
 
@@ -277,7 +277,7 @@ class MultiPaxosHandler:
 
         if not self._is_leader:
             if self._leader != None:
-                raise web.HTTPTemporaryRedirect(self.make_url(self._nodes[self._leader], MultiPaxosHandler.REQUEST))
+                raise web.HTTPTemporaryRedirect(self.make_url(self._nodes[self._leader], PBFTHandler.REQUEST))
             else:
                 raise web.HTTPServiceUnavailable()
         else:
@@ -326,7 +326,7 @@ class MultiPaxosHandler:
                 },
                 'type': Status.PREPARE
             }
-            await self._post(self._nodes, MultiPaxosHandler.COMMIT, prepare_msg)
+            await self._post(self._nodes, PBFTHandler.COMMIT, prepare_msg)
         return web.Response()
 
     async def commit(self, request):
@@ -375,7 +375,7 @@ class MultiPaxosHandler:
                     },
                     'type': Status.COMMIT
                 }
-                await self._post(self._nodes, MultiPaxosHandler.REPLY, commit_msg)
+                await self._post(self._nodes, PBFTHandler.REPLY, commit_msg)
         return web.Response()
 
     async def reply(self, request):
@@ -513,19 +513,19 @@ def main():
     host = addr['host']
     port = addr['port']
 
-    paxos = MultiPaxosHandler(args.index, conf)
+    pbft = PBFTHandler(args.index, conf)
     # asyncio.ensure_future(paxos.heartbeat_observer())
     # asyncio.ensure_future(paxos.decision_synchronizer())
 
     app = web.Application()
     app.add_routes([
-        web.post('/' + MultiPaxosHandler.REQUEST, paxos.get_request),
-        web.post('/' + MultiPaxosHandler.PREPREPARE, paxos.preprepare),
-        web.post('/' + MultiPaxosHandler.PREPARE, paxos.prepare),
-        web.post('/' + MultiPaxosHandler.COMMIT, paxos.commit),
-        web.post('/' + MultiPaxosHandler.REPLY, paxos.reply),
-        web.post('/' + MultiPaxosHandler.SYNC, paxos.sync),
-        web.post('/' + MultiPaxosHandler.HEARTBEAT, paxos.heartbeat),
+        web.post('/' + PBFTHandler.REQUEST, pbft.get_request),
+        web.post('/' + PBFTHandler.PREPREPARE, pbft.preprepare),
+        web.post('/' + PBFTHandler.PREPARE, pbft.prepare),
+        web.post('/' + PBFTHandler.COMMIT, pbft.commit),
+        web.post('/' + PBFTHandler.REPLY, pbft.reply),
+        web.post('/' + PBFTHandler.SYNC, pbft.sync),
+        web.post('/' + PBFTHandler.HEARTBEAT, pbft.heartbeat),
         ])
 
     web.run_app(app, host=host, port=port, access_log=None)
