@@ -12,6 +12,8 @@ import asyncio
 import aiohttp
 from aiohttp import web
 
+import hashlib
+
 class View:
     def __init__(self, leader_node = 0, times_for_leader = 0):
         self.leader_node = leader_node
@@ -27,6 +29,7 @@ class View:
 class Status:
     PREPARE = 'prepare'
     COMMIT = 'commit'
+    REPLY = "reply"
 
     def __init__(self, f):
         self.f = f
@@ -52,25 +55,28 @@ class Status:
             from_node: The node send given the message.
         '''
 
-        # The key need to include hash(proposal) in case get 
-        # different preposals from BFT nodes.
-        key = (view._to_tuple(), hash(json.dumps(proposal)))
-        if msg_type == 'prepare':
+        # The key need to include hash(proposal) in case get different 
+        # preposals from BFT nodes. Need sort key in json.dumps to make 
+        # sure getting the same string. Use hashlib so that we got same 
+        # hash everytime.
+        hash_object = hashlib.md5(json.dumps(proposal, sort_keys=True).encode())
+        key = (view._to_tuple(), hash_object.digest())
+        if msg_type == Status.PREPARE:
             if key not in self.prepare_msgs:
                 self.prepare_msgs[key] = self.SequenceElement(proposal)
             self.prepare_msgs[key].from_nodes.add(from_node)
-        elif msg_type == 'commit':
+        elif msg_type == Status.COMMIT:
             if key not in self.commit_msgs:
                 self.commit_msgs[key] = self.SequenceElement(proposal)
             self.commit_msgs[key].from_nodes.add(from_node)
 
     def _check_majority(self, msg_type):
         '''
-        Check if receive more than sf + 1 given type message in the same view.
+        Check if receive more than 2f + 1 given type message in the same view.
         input:
             msg_type: self.PREPARE or self.COMMIT
         '''
-        if msg_type == 'prepare':
+        if msg_type == Status.PREPARE:
             if self.prepare_certificate:
                 return True
             for key in self.prepare_msgs:
@@ -78,7 +84,7 @@ class Status:
                     return True
             return False
 
-        if msg_type == 'commit':
+        if msg_type == Status.COMMIT:
             if self.commit_certificate:
                 return True
             for key in self.commit_msgs:
@@ -205,7 +211,7 @@ class MultiPaxosHandler:
 
     async def _post(self, nodes, command, json_data):
         '''
-        Broadcast json_data to all node in nodes with given command
+        Broadcast json_data to all node in nodes with given command.
         input:
             nodes: list of nodes
             command: action
@@ -306,6 +312,7 @@ class MultiPaxosHandler:
             # when receive message with view > follow_view, update view
             self._follow_view._update_from_tuple(tuple(json_data['view']))
 
+        self._log.info("---> %d: receive preprepare msg from %d", self._index, json_data['leader'])
         self._log.info("---> %d: on prepare", self._index)
         for slot in json_data['proposal']:
             if slot not in self._status_by_slot:
@@ -338,7 +345,8 @@ class MultiPaxosHandler:
                 }
         '''
         json_data = await request.json()
-        
+        self._log.info("---> %d: receive prepare msg from %d", self._index, json_data['index'])
+
 
         # when receive message with view < follow_view, do nothing
         if tuple(json_data['view']) < self._follow_view._to_tuple():
@@ -355,7 +363,7 @@ class MultiPaxosHandler:
             view._update_from_tuple(tuple(json_data['view']))
 
             status._update_sequence(json_data['type'], 
-                view, json_data['proposal'], json_data['index'])
+                view, json_data['proposal'][slot], json_data['index'])
 
             if status._check_majority(json_data['type']):
                 status.prepare_certificate = json_data['proposal'][slot]
@@ -393,6 +401,8 @@ class MultiPaxosHandler:
         if tuple(json_data['view']) < self._follow_view._to_tuple():
             return web.Response()
 
+        self._log.info("---> %d: receive commit msg from %d", self._index, json_data['index'])
+
         for slot in json_data['proposal']:
             if slot not in self._status_by_slot:
                 self._status_by_slot[slot] = Status(self.f)
@@ -402,27 +412,27 @@ class MultiPaxosHandler:
             view._update_from_tuple(tuple(json_data['view']))
 
             status._update_sequence(json_data['type'], 
-                view, json_data['proposal'], json_data['index'])
+                view, json_data['proposal'][slot], json_data['index'])
 
-            print("state: ", status._check_majority(json_data['type']))
-            if status._check_majority(json_data['type']):
-                status.prepare_certificate = json_data['proposal'][slot]
+            # Reply only once.
+            if status._check_majority(json_data['type']) and not status.commit_certificate:
+                status.commit_certificate = json_data['proposal'][slot]
 
                 reply_msg = {
                     'index': self._index,
                     'view': json_data['view'],
                     'proposal': json_data['proposal'][slot],
-                    'type': 'reply'
+                    'type': Status.REPLY
                 }
 
-                print("reply to: ", json_data['proposal'][slot]['client_url'])
-                self._log.info("%d reply successfully!!", self._index)
-                """
+                self._log.info("%d reply to %s successfully!!", 
+                    self._index, json_data['proposal'][slot]['client_url'])
+                
                 try:
                     await self._session.post(json_data['proposal'][slot]['client_url'], json=reply_msg)
                 except:
                     pass
-                """
+                
         return web.Response()
 
     async def sync(self):
