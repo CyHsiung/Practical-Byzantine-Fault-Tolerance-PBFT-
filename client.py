@@ -175,7 +175,7 @@ class Client:
         self._status._update_sequence(view, json_data['proposal'], json_data['index'])
 
         if self._status._check_succeed():
-            self._log.info("Get reply from %d", json_data['index'])
+            # self._log.info("Get reply from %d", json_data['index'])
             self._is_request_succeed.set()
 
         return web.Response()
