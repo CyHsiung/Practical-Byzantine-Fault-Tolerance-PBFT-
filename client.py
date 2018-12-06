@@ -13,16 +13,17 @@ import hashlib
 
 
 class View:
-    def __init__(self, view_number = 0, times_for_leader = 0):
-        self.view_number = view_number
-        self.times_for_leader = times_for_leader
+    def __init__(self, view_number, num_nodes):
+        self._view_number = view_number
+        self._num_nodes = num_nodes
+        self._leader = None
     # To encode to json
-    def _to_tuple(self):
-        return (self.view_number, self.times_for_leader)
+    def get(self):
+        return self._view_number 
     # Recover from json data.
-    def _update_from_tuple(self, view_tuple):
-        self.view_number = view_tuple[0]
-        self.times_for_leader = view_tuple[1]
+    def set_view(self, view):
+        self._view_number = view
+        self._leader = view // self._num_nodes
 
 class Status:
     def __init__(self, f):
@@ -48,12 +49,12 @@ class Status:
         # sure getting the same string. Use hashlib so that we got same 
         # hash everytime.
         hash_object = hashlib.md5(json.dumps(proposal, sort_keys=True).encode())
-        key = (view._to_tuple(), hash_object.digest())
+        key = (view.get(), hash_object.digest())
         if key not in self.reply_msgs:
             self.reply_msgs[key] = self.SequenceElement(proposal)
         self.reply_msgs[key].from_nodes.add(from_node)
 
-    def _check_succeed(self, ):
+    def _check_succeed(self):
         '''
         Check if receive more than f + 1 given type message in the same view.
         input:
@@ -170,8 +171,7 @@ class Client:
         if time.time() - json_data['proposal']['timestamp'] >= self._resend_interval:
             return web.Response()
 
-        view = View()
-        view._update_from_tuple(tuple(json_data['view']))
+        view = View(json_data['view'], len(self._nodes))
         self._status._update_sequence(view, json_data['proposal'], json_data['index'])
 
         if self._status._check_succeed():

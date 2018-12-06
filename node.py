@@ -15,16 +15,17 @@ from aiohttp import web
 import hashlib
 
 class View:
-    def __init__(self, view_number = 0, times_for_leader = 0):
-        self.view_number = view_number
-        self.times_for_leader = times_for_leader
+    def __init__(self, view_number, num_nodes):
+        self._view_number = view_number
+        self._num_nodes = num_nodes
+        self._leader = view_number // num_nodes
     # To encode to json
-    def _to_tuple(self):
-        return (self.view_number, self.times_for_leader)
+    def get(self):
+        return self._view_number 
     # Recover from json data.
-    def _update_from_tuple(self, view_tuple):
-        self.view_number = view_tuple[0]
-        self.times_for_leader = view_tuple[1]
+    def set_view(self, view):
+        self._view_number = view
+        self._leader = view // self._num_nodes
 
 class Status:
     PREPARE = 'prepare'
@@ -45,7 +46,7 @@ class Status:
         self.is_committed = False
     
     class Certificate:
-        def __init__(self, view = 0, proposal = 0):
+        def __init__(self, view, proposal = 0):
             '''
             input:
                 view: object of class View
@@ -59,7 +60,7 @@ class Status:
             Convert the Certificate to dictionary
             '''
             return {
-                'view': self._view._to_tuple(),
+                'view': self._view.get(),
                 'proposal': self._proposal
             }
 
@@ -68,14 +69,11 @@ class Status:
             Update the view from the form after self.to_dict
             input:
                 dictionay = {
-                    'view': self._view._to_tuple(),
+                    'view': self._view.get(),
                     'proposal': self._proposal
                 }
             '''
-            view = View()
-            # print(dictionary)
-            view._update_from_tuple(dictionary['view'])
-            self._view = view
+            self._view.set_view(dictionary['view'])
             self._proposal = dictionary['proposal']
 
 
@@ -99,7 +97,7 @@ class Status:
         # sure getting the same string. Use hashlib so that we got same 
         # hash everytime.
         hash_object = hashlib.md5(json.dumps(proposal, sort_keys=True).encode())
-        key = (view._to_tuple(), hash_object.digest())
+        key = (view.get(), hash_object.digest())
         if msg_type == Status.PREPARE:
             if key not in self.prepare_msgs:
                 self.prepare_msgs[key] = self.SequenceElement(proposal)
@@ -331,7 +329,13 @@ class CheckPoint:
             if self._received_votes_by_ckpt[hash_ckpt].next_slot <= next_slot:
                 deletes.append(hash_ckpt)
         for hash_ckpt in deletes:
-            del self._received_votes_by_ckpt[hash_ckpt] 
+            del self._received_votes_by_ckpt[hash_ckpt]
+
+class ViewChange:
+    def __init__(self):
+        pass
+
+
 
 class PBFTHandler:
     REQUEST = 'request'
@@ -345,6 +349,8 @@ class PBFTHandler:
     RECEIVE_SYNC = 'receive_sync'
     RECEIVE_CKPT_VOTE = 'receive_ckpt_vote'
 
+    VIEW_CHANGE_REQUEST = 'view_change_request'
+
     def __init__(self, index, conf):
         self._nodes = conf['nodes']
         self._node_cnt = len(self._nodes)
@@ -354,7 +360,7 @@ class PBFTHandler:
         self._f = (self._node_cnt - 1) // 3
 
         # leader
-        self._view = View(self._index, 0)
+        self._view = View(0, self._node_cnt)
         self._next_propose_slot = 0
 
         # TODO: Test fixed
@@ -382,7 +388,7 @@ class PBFTHandler:
 
         # The largest view either promised or accepted
         # Same format as View._to_tuple
-        self._follow_view = View(0, 0)
+        self._follow_view = View(0, self._node_cnt)
         
         # Record all the status of the given slot
         # To adjust json key, slot is string integer.
@@ -504,7 +510,7 @@ class PBFTHandler:
 
         preprepare_msg = {
             'leader': self._index,
-            'view': self._view._to_tuple(),
+            'view': self._view.get(),
             'proposal': {
                 this_slot: json_data
             },
@@ -540,7 +546,7 @@ class PBFTHandler:
             request: preprepare message from preprepare:
                 preprepare_msg = {
                     'leader': self._index,
-                    'view': self._view._to_tuple,
+                    'view': self._view.get(),
                     'proposal': {
                         this_slot: json_data
                     }
@@ -550,13 +556,12 @@ class PBFTHandler:
         '''
         json_data = await request.json()
 
-        if tuple(json_data['view']) < self._follow_view._to_tuple():
+        if json_data['view'] < self._follow_view.get():
             # when receive message with view < follow_view, do nothing
             return web.Response()
-        elif tuple(json_data['view']) > self._follow_view._to_tuple():
-
+        elif json_data['view'] > self._follow_view.get():
             # when receive message with view > follow_view, update view
-            self._follow_view._update_from_tuple(tuple(json_data['view']))
+            self._follow_view.set_view(json_data['view'])
 
         self._log.info("---> %d: receive preprepare msg from %d", self._index, json_data['leader'])
         self._log.info("---> %d: on prepare", self._index)
@@ -598,9 +603,13 @@ class PBFTHandler:
         self._log.info("---> %d: receive prepare msg from %d", self._index, json_data['index'])
 
 
-        # when receive message with view < follow_view, do nothing
-        if tuple(json_data['view']) < self._follow_view._to_tuple():
+        if json_data['view'] < self._follow_view.get():
+            # when receive message with view < follow_view, do nothing
             return web.Response()
+        elif json_data['view'] > self._follow_view.get():
+            # when receive message with view > follow_view, update view
+            self._follow_view.set_view(json_data['view'])
+
 
         self._log.info("---> %d: on commit", self._index)
         
@@ -612,8 +621,7 @@ class PBFTHandler:
                 self._status_by_slot[slot] = Status(self._f)
             status = self._status_by_slot[slot]
 
-            view = View()
-            view._update_from_tuple(tuple(json_data['view']))
+            view = View(json_data['view'], self._node_cnt)
 
             status._update_sequence(json_data['type'], 
                 view, json_data['proposal'][slot], json_data['index'])
@@ -634,8 +642,9 @@ class PBFTHandler:
 
     async def reply(self, request):
         '''
-        Once receive more than 2f + 1 commit message,
-        append the commit certificate and lock.
+        Once receive more than 2f + 1 commit message, append the commit 
+        certificate and cannot change anymore. In addition, if there is 
+        no bubbles ahead, commit the given slots and update the last_commit_slot.
         input:
             request: commit message from prepare:
                 preprepare_msg = {
@@ -651,22 +660,25 @@ class PBFTHandler:
         json_data = await request.json()
         self._log.info("---> %d: on reply", self._index)
 
-        # when receive message with view < follow_view, do nothing
-        if tuple(json_data['view']) < self._follow_view._to_tuple():
+        if json_data['view'] < self._follow_view.get():
+            # when receive message with view < follow_view, do nothing
             return web.Response()
+        elif json_data['view'] > self._follow_view.get():
+            # when receive message with view > follow_view, update view
+            self._follow_view.set_view(json_data['view'])
+
 
         self._log.info("---> %d: receive commit msg from %d", self._index, json_data['index'])
 
         for slot in json_data['proposal']:
             if not self._legal_slot(slot):
                 continue
-            
+
             if slot not in self._status_by_slot:
                 self._status_by_slot[slot] = Status(self._f)
             status = self._status_by_slot[slot]
 
-            view = View()
-            view._update_from_tuple(tuple(json_data['view']))
+            view = View(json_data['view'], self._node_cnt)
 
             status._update_sequence(json_data['type'], 
                 view, json_data['proposal'][slot], json_data['index'])
@@ -773,11 +785,11 @@ class PBFTHandler:
             certificate = json_data['commit_certificates'][slot]
             if slot not in self._status_by_slot:
                 self._status_by_slot[slot] = Status(self._f)
-                commit_certificate = Status.Certificate()
+                commit_certificate = Status.Certificate(View(0, self._node_cnt))
                 commit_certificate.dumps_from_dict(certificate)
                 self._status_by_slot[slot].commit_certificate =  commit_certificate
             elif not self._status_by_slot[slot].commit_certificate:
-                commit_certificate = Status.Certificate()
+                commit_certificate = Status.Certificate(View(0, self._node_cnt))
                 commit_certificate.dumps_from_dict(certificate)
                 self._status_by_slot[slot].commit_certificate =  commit_certificate
 
@@ -822,6 +834,12 @@ class PBFTHandler:
             }
             await self._post(self._nodes, PBFTHandler.RECEIVE_SYNC, json_data)
 
+    async def get_view_change_request(self, request):
+        '''
+        Get view change request from client. Broadcast request to every replicas.
+        input:
+            request: view change request message from client.
+        '''
 
 
 def logging_config(log_level=logging.INFO, log_file=None):
@@ -909,6 +927,7 @@ def main():
         web.post('/' + PBFTHandler.REPLY, pbft.reply),
         web.post('/' + PBFTHandler.RECEIVE_CKPT_VOTE, pbft.receive_ckpt_vote),
         web.post('/' + PBFTHandler.RECEIVE_SYNC, pbft.receive_sync),
+        web.post('/' + PBFTHandler.VIEW_CHANGE_REQUEST, pbft.get_view_change_request),
         ])
 
     web.run_app(app, host=host, port=port, access_log=None)
