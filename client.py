@@ -13,15 +13,15 @@ import hashlib
 
 
 class View:
-    def __init__(self, leader_node = 0, times_for_leader = 0):
-        self.leader_node = leader_node
+    def __init__(self, view_number = 0, times_for_leader = 0):
+        self.view_number = view_number
         self.times_for_leader = times_for_leader
     # To encode to json
     def _to_tuple(self):
-        return (self.leader_node, self.times_for_leader)
+        return (self.view_number, self.times_for_leader)
     # Recover from json data.
     def _update_from_tuple(self, view_tuple):
-        self.leader_node = view_tuple[0]
+        self.view_number = view_tuple[0]
         self.times_for_leader = view_tuple[1]
 
 class Status:
@@ -36,7 +36,7 @@ class Status:
 
     def _update_sequence(self, view, proposal, from_node):
         '''
-        Update the record in the status by message type
+        Update the record in the status when receive reply messages.
         input:
             view: View object of self._follow_view
             proposal: proposal in json_data

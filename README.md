@@ -46,5 +46,11 @@ The `id` here is a tuple of `(client_id, seq_id)`, `client_url` is the url for s
 `timestamp` is the current time, `data` is whatever data in string format, 
 
 ## Run the clients
-for i in {0...2}; do python client.py -id $i -nm 5 &; done
+`for i in {0...2}; do python client.py -id $i -nm 5 &; done`
 
+## Requirement
+```
+Python: 3.5.3
+aiohttp: 3.4.4
+yaml: 3.12
+```
