@@ -16,11 +16,7 @@ clients:
 
 loss%: 0
 
-skip:
-
-heartbeat:
-    ttl: 20
-    interval: 10
+ckpt_interval: 10
 
 election_slice: 10
 
