@@ -18,9 +18,9 @@ loss%: 0
 
 ckpt_interval: 10
 
-election_slice: 10
+retry_times_before_view_change: 2
 
-sync_interval: 10
+sync_interval: 5
 
 misc:
-    network_timeout: 10
+    network_timeout: 5

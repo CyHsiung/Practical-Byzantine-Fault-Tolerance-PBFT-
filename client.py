@@ -16,14 +16,14 @@ class View:
     def __init__(self, view_number, num_nodes):
         self._view_number = view_number
         self._num_nodes = num_nodes
-        self._leader = None
+        self._leader = view_number % num_nodes
     # To encode to json
     def get(self):
         return self._view_number 
     # Recover from json data.
     def set_view(self, view):
         self._view_number = view
-        self._leader = view // self._num_nodes
+        self._leader = view % self._num_nodes
 
 class Status:
     def __init__(self, f):
@@ -130,6 +130,7 @@ def make_url(node, command):
 class Client:
     REQUEST = "request"
     REPLY = "reply"
+    VIEW_CHANGE_REQUEST = 'view_change_request'
 
     def __init__(self, conf, args, log):
         self._nodes = conf['nodes']
@@ -142,6 +143,7 @@ class Client:
             self._address['port'])
         self._log = log
 
+        self._retry_times = conf['retry_times_before_view_change']
         # Number of faults tolerant.
         self._f = (len(self._nodes) - 1) // 3
 
@@ -149,6 +151,23 @@ class Client:
         self._is_request_succeed = None
         # To record the status of current request
         self._status = None
+
+    async def request_view_change(self):
+        json_data = {
+            "action" : "view change"
+        }
+        for i in range(len(self._nodes)):
+            try:
+                await self._session.post(make_url(
+                    self._nodes[i], Client.VIEW_CHANGE_REQUEST), json=json_data)
+            except:
+                self._log.info("---> %d failed to send view change message to node %d.", 
+                    self._client_id, i)
+            else:
+                self._log.info("---> %d succeed in sending view change message to node %d.", 
+                    self._client_id, i)
+
+
 
     async def get_reply(self, request):
         '''
@@ -187,6 +206,8 @@ class Client:
             self._session = aiohttp.ClientSession(timeout = timeout)
          
         for i in range(self._num_messages):
+            
+            accumulate_failure = 0
             is_sent = False
             dest_ind = 0
             self._is_request_succeed = asyncio.Event()
@@ -198,6 +219,7 @@ class Client:
                 'timestamp': time.time(),
                 'data': str(i)        
             }
+
             while 1:
                 try:
                     self._status = Status(self._f)
@@ -205,17 +227,25 @@ class Client:
 
                     await asyncio.wait_for(self._is_request_succeed.wait(), self._resend_interval)
                 except:
+                    
                     json_data['timestamp'] = time.time()
                     self._status = Status(self._f)
                     self._is_request_succeed.clear()
                     self._log.info("---> %d message %d sent fail.", self._client_id, i)
-                    pass
+
+                    accumulate_failure += 1
+                    if accumulate_failure == self._retry_times:
+                        await self.request_view_change()
+                        # Sleep 0 - 1 second for view change
+                        await asyncio.sleep(random())
+                        accumulate_failure = 0
+                        dest_ind = (dest_ind + 1) % len(self._nodes)
                 else:
                     self._log.info("---> %d message %d sent successfully.", self._client_id, i)
                     is_sent = True
                 if is_sent:
                     break
-        self._session.close()
+        await self._session.close()
     
 
 def main():

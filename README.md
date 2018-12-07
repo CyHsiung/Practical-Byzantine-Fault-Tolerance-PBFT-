@@ -12,7 +12,6 @@ nodes:
       port: 30002
     - host: localhost
       port: 30003
-    - host: localhost
 
 clients:
     - host: localhost
@@ -22,18 +21,14 @@ clients:
 
 loss%: 0
 
-skip: 10
+ckpt_interval: 10
 
-heartbeat:
-    ttl: 20
-    interval: 10
+retry_times_before_view_change: 2
 
-election_slice: 10
-
-sync_interval: 10
+sync_interval: 5
 
 misc:
-    network_timeout: 10
+    network_timeout: 5
 ```
 
 ## Run the nodes
@@ -48,7 +43,7 @@ The `id` here is a tuple of `(client_id, seq_id)`, `client_url` is the url for s
 ## Run the clients
 `for i in {0...2}; do python client.py -id $i -nm 5 &; done`
 
-## Requirement
+## Environment
 ```
 Python: 3.5.3
 aiohttp: 3.4.4
